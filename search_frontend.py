@@ -1,4 +1,70 @@
 from flask import Flask, request, jsonify
+import os
+# Set this BEFORE importing any google/index libraries
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\inbal\PycharmProjects\irProject\irproject-478010-e3f3d84eaa29.json"
+import math
+import heapq
+
+# -----------------------------------------------------------------------------------------------
+"hash function and stopwords from assignment 3:"
+
+import sys
+from collections import Counter, OrderedDict
+import itertools
+from itertools import islice, count, groupby
+import pandas as pd
+import os
+import re
+from operator import itemgetter
+import nltk
+from nltk.stem.porter import *
+from nltk.corpus import stopwords
+from time import time
+from timeit import timeit
+from pathlib import Path
+import pickle
+import pandas as pd
+import numpy as np
+from google.cloud import storage
+
+import hashlib
+def _hash(s):
+    return hashlib.blake2b(bytes(s, encoding='utf8'), digest_size=5).hexdigest()
+
+#from inverted_index_colab import *
+from inverted_index_gcp import *
+
+# define english stopwords from nltk Oct 2025
+english_stopwords = frozenset([
+    "during", "as", "whom", "no", "so", "shouldn't", "she's", "were", "needn", "then", "on",
+    "should've", "once", "very", "any", "they've", "it's", "it", "be", "why", "ma", "over",
+    "you'll", "they", "you've", "am", "before", "shan", "nor", "she'd", "because", "been",
+    "doesn't", "than", "will", "they'd", "not", "those", "had", "this", "through", "again",
+    "ours", "having", "himself", "into", "i'm", "did", "hadn", "haven", "should", "above",
+    "we've", "does", "now", "m", "down", "he'd", "herself", "t", "their", "hasn't", "few",
+    "and", "mightn't", "some", "do", "the", "we're", "myself", "i'd", "won", "after",
+    "needn't", "wasn't", "them", "don", "further", "we'll", "hasn", "haven't", "out", "where",
+    "mustn't", "won't", "at", "against", "shan't", "has", "all", "s", "being", "he'll", "he",
+    "its", "that", "more", "by", "who", "i've", "o", "that'll", "there", "too", "they'll",
+    "own", "aren't", "other", "an", "here", "between", "hadn't", "isn't", "below", "yourselves",
+    "ve", "isn", "wouldn", "d", "we", "couldn", "ain", "his", "wouldn't", "was", "didn", "what",
+    "when", "i", "i'll", "with", "her", "same", "you're", "yours", "couldn't", "for", "doing",
+    "each", "aren", "which", "such", "mightn", "up", "mustn", "you", "only", "most", "of", "me",
+    "she", "he's", "in", "a", "if", "but", "these", "him", "hers", "both", "my", "she'll", "re",
+    "weren", "yourself", "is", "until", "weren't", "to", "are", "itself", "you'd", "themselves",
+    "ourselves", "just", "wasn", "have", "don't", "ll", "how", "they're", "about", "shouldn",
+    "can", "our", "we'd", "from", "it'd", "under", "while", "off", "y", "doesn", "theirs",
+    "didn't", "or", "your", "it'll"
+])
+
+corpus_stopwords = ['category', 'references', 'also', 'links', 'extenal', 'see', 'thumb']
+RE_WORD = re.compile(r"""[\#\@\w](['\-]?\w){2,24}""", re.UNICODE)
+
+all_stopwords = english_stopwords.union(corpus_stopwords)
+
+"end of hash function  and stopwords from assignment 3"
+# --------------------------------------------------------------------------------------------------
+
 
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
@@ -31,8 +97,58 @@ def search():
       return jsonify(res)
     # BEGIN SOLUTION
 
+    # tokenization and removing stopwords
+    tokens_with_stop_words = [token.group() for token in RE_WORD.finditer(query.lower())]
+    query_tokens = []
+    for token in tokens_with_stop_words:
+        if token not in all_stopwords:
+            query_tokens.append(token)
+
+    # get posting list for each token in the query
+    index = InvertedIndex.read_index("", "postings_gcp_index")
+    index.bucket_name = 'ir_bucket_storage'
+    pls = []
+    for token in query_tokens:
+        try:
+            pls.append(dict(index.read_a_posting_list("postings_gcp", token, "ir_bucket_storage")))
+        except Exception as e:
+            # This handles tokens not found in the index
+            print(f"Token '{token}' skipped: {e}")
+            continue
+
+    # calculate cosine similarity score for the relevant docs
+    docs_scores_dict = get_cosine_similarity_score(index, query_tokens, pls)
+
+    # sort and add titles, take top 100 docs
+    top_n_items = heapq.nlargest(100, docs_scores_dict.items(), key=lambda x: x[1])
+    print(top_n_items)
+    res = [(doc_id, index.titles[doc_id]) for doc_id, score in top_n_items]
     # END SOLUTION
     return jsonify(res)
+
+
+def get_cosine_similarity_score(index, query_tokens, pls, above_tfidf = 1):
+    docs_scores_dict = {}
+    query_index = 0
+    # N = len(index.DL)
+    N = 12
+    for pl in pls:
+        for doc_id in pl:
+            tfidf = calc_tfidf(index, query_tokens[query_index], pl[doc_id]**above_tfidf, doc_id, N)
+            docs_scores_dict[doc_id] = docs_scores_dict.get(doc_id, 0) + tfidf
+        query_index += 1
+    q_len = len(query_tokens) ** 0.5
+    for doc_id in docs_scores_dict:
+        # docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (index.DL[doc_id]**0.5))
+        docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (5**0.5))
+    return docs_scores_dict
+
+
+def calc_tfidf(index, token, tf, doc_id, N):
+    # ntf = (tf)/index.DL[doc_id]
+    ntf = (tf)/5
+    idf = math.log(N/index.df[token], 10)
+    return ntf*idf
 
 @app.route("/search_body")
 def search_body():
