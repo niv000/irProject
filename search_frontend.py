@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 import os
-# Set this BEFORE importing any google/index libraries
+# TODO: CHECK PATH
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\inbal\PycharmProjects\irProject\irproject-478010-e3f3d84eaa29.json"
 import math
 import heapq
@@ -105,7 +105,7 @@ def search():
             query_tokens.append(token)
 
     # get posting list for each token in the query
-    index = InvertedIndex.read_index("", "postings_gcp_index")
+    index = InvertedIndex.read_index("", "postings_gcp_index (3)")
     index.bucket_name = 'ir_bucket_storage'
     pls = []
     for token in query_tokens:
@@ -113,41 +113,46 @@ def search():
             pls.append(dict(index.read_a_posting_list("postings_gcp", token, "ir_bucket_storage")))
         except Exception as e:
             # This handles tokens not found in the index
-            print(f"Token '{token}' skipped: {e}")
+            # print(f"Token '{token}' skipped: {e}")
             continue
 
+    # get docs length and corpus size
+    if os.path.exists('id_doc_length_pairs.pkl'):
+        with open('id_doc_length_pairs.pkl', 'rb') as f:
+            doc_length_dict = pickle.load(f)
+
     # calculate cosine similarity score for the relevant docs
-    docs_scores_dict = get_cosine_similarity_score(index, query_tokens, pls)
+    docs_scores_dict = get_cosine_similarity_score(index, query_tokens, pls, doc_length_dict)
 
     # sort and add titles, take top 100 docs
     top_n_items = heapq.nlargest(100, docs_scores_dict.items(), key=lambda x: x[1])
-    print(top_n_items)
-    res = [(doc_id, index.titles[doc_id]) for doc_id, score in top_n_items]
+
+    if os.path.exists('id_title_pairs.pkl'):
+        with open('id_title_pairs.pkl', 'rb') as f:
+            titles_dict = pickle.load(f)
+    res = [(doc_id, titles_dict[doc_id]) for doc_id, score in top_n_items]
     # END SOLUTION
     return jsonify(res)
 
 
-def get_cosine_similarity_score(index, query_tokens, pls, above_tfidf = 1):
+def get_cosine_similarity_score(index, query_tokens, pls, doc_length_dict, above_tfidf = 1):
     docs_scores_dict = {}
     query_index = 0
-    # N = len(index.DL)
-    N = 12
+    corpus_size = len(doc_length_dict)
     for pl in pls:
         for doc_id in pl:
-            tfidf = calc_tfidf(index, query_tokens[query_index], pl[doc_id]**above_tfidf, doc_id, N)
+            tfidf = calc_tfidf(index, query_tokens[query_index], pl[doc_id]**above_tfidf, doc_id, corpus_size, doc_length_dict)
             docs_scores_dict[doc_id] = docs_scores_dict.get(doc_id, 0) + tfidf
         query_index += 1
     q_len = len(query_tokens) ** 0.5
     for doc_id in docs_scores_dict:
-        # docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (index.DL[doc_id]**0.5))
-        docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (5**0.5))
+        docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (doc_length_dict[doc_id]**0.5))
     return docs_scores_dict
 
 
-def calc_tfidf(index, token, tf, doc_id, N):
-    # ntf = (tf)/index.DL[doc_id]
-    ntf = (tf)/5
-    idf = math.log(N/index.df[token], 10)
+def calc_tfidf(index, token, tf, doc_id, corpus_size, doc_length_dict):
+    ntf = (tf)/doc_length_dict[doc_id]
+    idf = math.log(corpus_size/index.df[token], 10)
     return ntf*idf
 
 @app.route("/search_body")
