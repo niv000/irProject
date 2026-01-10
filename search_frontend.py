@@ -1,40 +1,23 @@
 from flask import Flask, request, jsonify
 import os
-# Set this BEFORE importing any google/index libraries
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\inbal\PycharmProjects\irProject\irproject-478010-e3f3d84eaa29.json"
+import re
 import math
 import heapq
-
-# -----------------------------------------------------------------------------------------------
-"hash function and stopwords from assignment 3:"
-
-import sys
-from collections import Counter, OrderedDict
-import itertools
-from itertools import islice, count, groupby
-import pandas as pd
-import os
-import re
-from operator import itemgetter
-import nltk
-from nltk.stem.porter import *
-from nltk.corpus import stopwords
-from time import time
-from timeit import timeit
-from pathlib import Path
 import pickle
-import pandas as pd
-import numpy as np
+from pathlib import Path
+from typing import Dict, List, Tuple, Iterable
 from google.cloud import storage
-
-import hashlib
-def _hash(s):
-    return hashlib.blake2b(bytes(s, encoding='utf8'), digest_size=5).hexdigest()
-
-#from inverted_index_colab import *
 from inverted_index_gcp import *
 
-# define english stopwords from nltk Oct 2025
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\inbal\PycharmProjects\irProject\irproject-478010-e3f3d84eaa29.json"
+
+# -----------------------------------------------------------------------------------------------
+# "hash function and stopwords from assignment 3:"
+# import hashlib
+# def _hash(s):
+#     return hashlib.blake2b(bytes(s, encoding='utf8'), digest_size=5).hexdigest()
+# -----------------------------------------------------------------------------------------------
+
 english_stopwords = frozenset([
     "during", "as", "whom", "no", "so", "shouldn't", "she's", "were", "needn", "then", "on",
     "should've", "once", "very", "any", "they've", "it's", "it", "be", "why", "ma", "over",
@@ -62,9 +45,14 @@ RE_WORD = re.compile(r"""[\#\@\w](['\-]?\w){2,24}""", re.UNICODE)
 
 all_stopwords = english_stopwords.union(corpus_stopwords)
 
-"end of hash function  and stopwords from assignment 3"
-# --------------------------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------------------------
+def tokenize(text: str) -> List[str]:
+    if not text:
+        return []
+    return [t.group().lower() for t in RE_WORD.finditer(text.lower())
+            if t.group().lower() not in all_stopwords]
 
+# -----------------------------------------------------------------------------------------------
 
 class MyFlaskApp(Flask):
     def run(self, host=None, port=None, debug=None, **options):
@@ -72,6 +60,277 @@ class MyFlaskApp(Flask):
 
 app = MyFlaskApp(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+
+BUCKET_NAME = os.environ.get("IR_BUCKET_NAME", "ir_bucket_storage")
+POSTINGS_PREFIX = os.environ.get("IR_POSTINGS_PREFIX", "postings_gcp")
+
+# Index file names (change if your pickles are named differently) //TODO: check if the names are correct
+BODY_INDEX_NAME = os.environ.get("IR_BODY_INDEX_NAME", "postings_gcp_index")
+TITLE_INDEX_NAME = os.environ.get("IR_TITLE_INDEX_NAME", "postings_gcp_title_index")
+ANCHOR_INDEX_NAME = os.environ.get("IR_ANCHOR_INDEX_NAME", "postings_gcp_anchor_index")
+
+# Optional metadata files (recommended)
+TITLES_PKL = os.environ.get("IR_TITLES_PKL", "doc_id_to_title.pkl")      # {doc_id:int -> title:str}
+DL_PKL = os.environ.get("IR_DL_PKL", "doc_len.pkl")                      # {doc_id:int -> doc_len:int}
+PAGERANK_PKL = os.environ.get("IR_PAGERANK_PKL", "pagerank.pkl")         # {doc_id:int -> float}
+PAGEVIEWS_PKL = os.environ.get("IR_PAGEVIEWS_PKL", "pageviews.pkl")
+
+def _safe_load_pickle(path: str, default):
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception:
+        return default
+
+# Load indices (if some are missing, endpoints still work but return empty results)
+try:
+    BODY_INDEX = InvertedIndex.read_index("", BODY_INDEX_NAME)
+    BODY_INDEX.bucket_name = BUCKET_NAME
+except Exception: # TODO: add prints just to check if it works
+    BODY_INDEX = None
+
+try:
+    TITLE_INDEX = InvertedIndex.read_index("", TITLE_INDEX_NAME)
+    TITLE_INDEX.bucket_name = BUCKET_NAME
+except Exception:
+    TITLE_INDEX = None
+
+try:
+    ANCHOR_INDEX = InvertedIndex.read_index("", ANCHOR_INDEX_NAME)
+    ANCHOR_INDEX.bucket_name = BUCKET_NAME
+except Exception:
+    ANCHOR_INDEX = None
+
+DOC_TITLES: Dict[int, str] = _safe_load_pickle(TITLES_PKL, {})
+DL: Dict[int, int] = _safe_load_pickle(DL_PKL, {})
+PAGERANK: Dict[int, float] = _safe_load_pickle(PAGERANK_PKL, {})
+PAGEVIEWS: Dict[int, int] = _safe_load_pickle(PAGEVIEWS_PKL, {})
+
+# Corpus stats
+N_DOCS = len(DL) if DL else 1
+AVGDL = (sum(DL.values()) / N_DOCS) if DL else 100.0  # fallback
+
+
+_gcs_client = storage.Client()  # OK to keep as global
+
+def _download_range(bucket: storage.Bucket, blob_path: str, start: int, length: int) -> bytes:
+    """
+    Download a byte range from a blob.
+    """
+    blob = bucket.blob(blob_path)
+    end = start + length - 1
+    return blob.download_as_bytes(start=start, end=end)
+
+
+def _decode_postings(raw: bytes) -> List[Tuple[int, int]]:
+    """
+    Decode postings from bytes.
+    Supports:
+    - 6-byte format: doc_id(4 bytes) + tf(2 bytes)  [as in your InvertedIndex.posting_lists_iter]
+    - 8-byte packed format: (doc_id << 16 | tf) in 8 bytes  [common in staff solutions]
+    """
+    postings = []
+
+    # Try 6-byte chunks first if length aligns
+    if len(raw) % 6 == 0:
+        step = 6
+        for i in range(0, len(raw), step):
+            doc_id = int.from_bytes(raw[i:i+4], "big")
+            tf = int.from_bytes(raw[i+4:i+6], "big")
+            postings.append((doc_id, tf))
+        return postings
+
+    # Fallback: try 8-byte chunks packed
+    if len(raw) % 8 == 0:
+        step = 8
+        for i in range(0, len(raw), step):
+            val = int.from_bytes(raw[i:i+8], "big")
+            doc_id = val >> 16
+            tf = val & TF_MASK
+            postings.append((doc_id, tf))
+        return postings
+
+    # Last resort: try tuple size from index if available
+    # (won't fix a mismatched encoding but avoids silent wrong reads)
+    return postings
+
+
+def read_posting_list(index: InvertedIndex, term: str) -> List[Tuple[int, int]]:
+    """
+    Read posting list for `term`.
+    Preference order:
+    1) If index has read_a_posting_list(...) use it (your current code expects this).
+    2) Else read bytes directly from GCS using index.posting_locs.
+    """
+    if index is None:
+        return []
+
+    # 1) Use existing method if present
+    if hasattr(index, "read_a_posting_list"):
+        try:
+            return list(index.read_a_posting_list(POSTINGS_PREFIX, term, BUCKET_NAME))
+        except Exception:
+            return []
+
+    # 2) Direct read from GCS using posting_locs
+    locs = index.posting_locs.get(term)
+    if not locs:
+        return []
+
+    bucket = _gcs_client.bucket(BUCKET_NAME)
+
+    # total bytes to read should be df * tuple_size (6 or maybe 8 in your files)
+    df = index.df.get(term, 0)
+    if df <= 0:
+        return []
+
+    # First attempt: assume 6-byte tuples (as in your InvertedIndex.posting_lists_iter)
+    want_bytes_6 = df * 6
+
+    # We may have multiple locations across blocks/files
+    chunks = []
+    remaining = want_bytes_6
+
+    # locs is usually a list of (file_name, offset) pairs
+    for f_name, offset in locs:
+        if remaining <= 0:
+            break
+
+        # In your writer, you upload to "postings_gcp/<file_name>"
+        # Sometimes f_name includes "./" -> normalize it
+        f_name_norm = str(f_name).replace("\\", "/")
+        f_name_norm = f_name_norm.split("/")[-1]  # keep basename
+        blob_path = f"{POSTINGS_PREFIX}/{f_name_norm}"
+
+        # We don’t know the exact block boundary here; download remaining bytes from offset
+        # If the file is shorter, GCS will just return what exists.
+        try:
+            data = _download_range(bucket, blob_path, int(offset), int(remaining))
+        except Exception:
+            data = b""
+
+        chunks.append(data)
+        remaining -= len(data)
+
+        if len(data) == 0:
+            break
+
+    raw = b"".join(chunks)
+
+    # If 6-byte decode yields empty, try 8-byte expectation as well
+    pl = _decode_postings(raw)
+    if pl:
+        return pl
+
+    # Retry with 8-byte expectation if needed
+    want_bytes_8 = df * 8
+    chunks = []
+    remaining = want_bytes_8
+    for f_name, offset in locs:
+        if remaining <= 0:
+            break
+
+        f_name_norm = str(f_name).replace("\\", "/")
+        f_name_norm = f_name_norm.split("/")[-1]
+        blob_path = f"{POSTINGS_PREFIX}/{f_name_norm}"
+
+        try:
+            data = _download_range(bucket, blob_path, int(offset), int(remaining))
+        except Exception:
+            data = b""
+
+        chunks.append(data)
+        remaining -= len(data)
+        if len(data) == 0:
+            break
+
+    raw = b"".join(chunks)
+    return _decode_postings(raw)
+
+
+# --------------------------
+# Ranking functions
+# --------------------------
+
+def bm25_rank(query_terms: List[str],
+              index: InvertedIndex,
+              top_k: int = 100,
+              per_term_k: int = 2000,
+              k1: float = 1.5,
+              b: float = 0.75) -> List[Tuple[int, float]]:
+    """
+    BM25 over `index` using postings.
+    No cross-query caching. We prune per term to limit candidates.
+    """
+    if index is None:
+        return []
+
+    scores: Dict[int, float] = {}
+
+    for t in query_terms:
+        df = index.df.get(t, 0)
+        if df <= 0:
+            continue
+
+        pl = read_posting_list(index, t)
+        if not pl:
+            continue
+
+        # prune big posting lists (runtime win; often helps quality too)
+        if per_term_k is not None and len(pl) > per_term_k:
+            pl = heapq.nlargest(per_term_k, pl, key=lambda x: x[1])
+
+        # BM25 idf
+        idf = math.log(1.0 + (N_DOCS - df + 0.5) / (df + 0.5))
+
+        for doc_id, tf in pl:
+            dl = DL.get(doc_id, AVGDL)
+            denom = tf + k1 * (1.0 - b + b * (dl / AVGDL))
+            score = idf * (tf * (k1 + 1.0)) / denom
+            scores[doc_id] = scores.get(doc_id, 0.0) + score
+
+    return heapq.nlargest(top_k, scores.items(), key=lambda x: x[1])
+
+
+def title_binary_candidates(query_terms: List[str], title_index: InvertedIndex) -> Dict[int, int]:
+    """
+    Count how many unique query terms appear in title for each doc (binary matching per term).
+    Returns {doc_id -> hits}.
+    """
+    hits: Dict[int, int] = {}
+    if title_index is None:
+        return hits
+
+    for t in set(query_terms):
+        pl = read_posting_list(title_index, t)
+        for doc_id, _tf in pl:
+            hits[doc_id] = hits.get(doc_id, 0) + 1
+    return hits
+
+
+def merge_body_and_title(body_ranked: List[Tuple[int, float]],
+                         title_hits: Dict[int, int],
+                         query_len: int,
+                         body_w: float = 0.7,
+                         title_w: float = 0.3,
+                         top_k: int = 100) -> List[Tuple[int, float]]:
+    """
+    Merge scores. Title part is normalized by query length.
+    """
+    scores: Dict[int, float] = {}
+    for doc_id, s in body_ranked:
+        scores[doc_id] = scores.get(doc_id, 0.0) + body_w * s
+
+    if query_len > 0:
+        for doc_id, h in title_hits.items():
+            scores[doc_id] = scores.get(doc_id, 0.0) + title_w * (h / query_len)
+
+    return heapq.nlargest(top_k, scores.items(), key=lambda x: x[1])
+
+
+def get_title(doc_id: int) -> str:
+    return DOC_TITLES.get(int(doc_id), "")
+
 
 @app.route("/search")
 def search():
@@ -95,60 +354,21 @@ def search():
     query = request.args.get('query', '')
     if len(query) == 0:
       return jsonify(res)
+
     # BEGIN SOLUTION
+    q_terms = tokenize(query)
+    # Body BM25
+    body_ranked = bm25_rank(q_terms, BODY_INDEX, top_k=200, per_term_k=2000)
 
-    # tokenization and removing stopwords
-    tokens_with_stop_words = [token.group() for token in RE_WORD.finditer(query.lower())]
-    query_tokens = []
-    for token in tokens_with_stop_words:
-        if token not in all_stopwords:
-            query_tokens.append(token)
+    # Title binary boost (optional)
+    t_hits = title_binary_candidates(q_terms, TITLE_INDEX) if TITLE_INDEX else {}
+    merged = merge_body_and_title(body_ranked, t_hits, query_len=len(set(q_terms)),
+                                    body_w=0.75, title_w=0.25, top_k=100)
 
-    # get posting list for each token in the query
-    index = InvertedIndex.read_index("", "postings_gcp_index")
-    index.bucket_name = 'ir_bucket_storage'
-    pls = []
-    for token in query_tokens:
-        try:
-            pls.append(dict(index.read_a_posting_list("postings_gcp", token, "ir_bucket_storage")))
-        except Exception as e:
-            # This handles tokens not found in the index
-            print(f"Token '{token}' skipped: {e}")
-            continue
-
-    # calculate cosine similarity score for the relevant docs
-    docs_scores_dict = get_cosine_similarity_score(index, query_tokens, pls)
-
-    # sort and add titles, take top 100 docs
-    top_n_items = heapq.nlargest(100, docs_scores_dict.items(), key=lambda x: x[1])
-    print(top_n_items)
-    res = [(doc_id, index.titles[doc_id]) for doc_id, score in top_n_items]
+    res = [(int(doc_id), get_title(doc_id)) for doc_id, _s in merged]
     # END SOLUTION
     return jsonify(res)
 
-
-def get_cosine_similarity_score(index, query_tokens, pls, above_tfidf = 1):
-    docs_scores_dict = {}
-    query_index = 0
-    # N = len(index.DL)
-    N = 12
-    for pl in pls:
-        for doc_id in pl:
-            tfidf = calc_tfidf(index, query_tokens[query_index], pl[doc_id]**above_tfidf, doc_id, N)
-            docs_scores_dict[doc_id] = docs_scores_dict.get(doc_id, 0) + tfidf
-        query_index += 1
-    q_len = len(query_tokens) ** 0.5
-    for doc_id in docs_scores_dict:
-        # docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (index.DL[doc_id]**0.5))
-        docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (5**0.5))
-    return docs_scores_dict
-
-
-def calc_tfidf(index, token, tf, doc_id, N):
-    # ntf = (tf)/index.DL[doc_id]
-    ntf = (tf)/5
-    idf = math.log(N/index.df[token], 10)
-    return ntf*idf
 
 @app.route("/search_body")
 def search_body():
@@ -170,8 +390,12 @@ def search_body():
     query = request.args.get('query', '')
     if len(query) == 0:
       return jsonify(res)
-    # BEGIN SOLUTION
 
+    # BEGIN SOLUTION
+    q_terms = tokenize(query)
+
+    ranked = bm25_rank(q_terms, BODY_INDEX, top_k=100, per_term_k=3000)
+    res = [(int(doc_id), get_title(doc_id)) for doc_id, _s in ranked]
     # END SOLUTION
     return jsonify(res)
 
@@ -200,8 +424,17 @@ def search_title():
     query = request.args.get('query', '')
     if len(query) == 0:
       return jsonify(res)
-    # BEGIN SOLUTION
 
+    # BEGIN SOLUTION
+    q_terms = tokenize(query)
+    if TITLE_INDEX is None:
+        return jsonify([])
+
+    hits = title_binary_candidates(q_terms, TITLE_INDEX)
+
+    # rank by hit count desc, tie-break doc_id asc for determinism
+    ranked = sorted(hits.items(), key=lambda x: (-x[1], x[0]))[:100]
+    res = [(int(doc_id), get_title(doc_id)) for doc_id, _h in ranked]
     # END SOLUTION
     return jsonify(res)
 
@@ -231,7 +464,19 @@ def search_anchor():
     if len(query) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-    
+
+    q_terms = tokenize(query)
+    if ANCHOR_INDEX is None:
+        return jsonify([])
+
+    hits: Dict[int, int] = {}
+    for t in set(q_terms):
+        pl = read_posting_list(ANCHOR_INDEX, t)
+        for doc_id, _tf in pl:
+            hits[doc_id] = hits.get(doc_id, 0) + 1
+
+    ranked = sorted(hits.items(), key=lambda x: (-x[1], x[0]))[:100]
+    res = [(int(doc_id), get_title(doc_id)) for doc_id, _h in ranked]
     # END SOLUTION
     return jsonify(res)
 
@@ -256,7 +501,7 @@ def get_pagerank():
     if len(wiki_ids) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-
+    res = [float(PAGERANK.get(int(doc_id), 0.0)) for doc_id in wiki_ids]
     # END SOLUTION
     return jsonify(res)
 
@@ -283,7 +528,7 @@ def get_pageview():
     if len(wiki_ids) == 0:
       return jsonify(res)
     # BEGIN SOLUTION
-
+    res = [int(PAGEVIEWS.get(int(doc_id), 0)) for doc_id in wiki_ids]
     # END SOLUTION
     return jsonify(res)
 
