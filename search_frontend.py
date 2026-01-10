@@ -31,7 +31,6 @@ import hashlib
 def _hash(s):
     return hashlib.blake2b(bytes(s, encoding='utf8'), digest_size=5).hexdigest()
 
-#from inverted_index_colab import *
 from inverted_index_gcp import *
 
 # define english stopwords from nltk Oct 2025
@@ -57,7 +56,7 @@ english_stopwords = frozenset([
     "didn't", "or", "your", "it'll"
 ])
 
-corpus_stopwords = ['category', 'references', 'also', 'links', 'extenal', 'see', 'thumb']
+corpus_stopwords = ['category', 'references', 'also', 'links', 'external', 'see', 'thumb']
 RE_WORD = re.compile(r"""[\#\@\w](['\-]?\w){2,24}""", re.UNICODE)
 
 all_stopwords = english_stopwords.union(corpus_stopwords)
@@ -72,6 +71,110 @@ class MyFlaskApp(Flask):
 
 app = MyFlaskApp(__name__)
 app.config['JSONIFY_PRETTYPRINT_REGULAR'] = False
+
+
+index = InvertedIndex.read_index("", "postings_gcp_index (3)")
+index.bucket_name = 'ir_bucket_storage'
+
+# get titles  per doc id
+if os.path.exists('id_title_pairs.pkl'):
+    with open('id_title_pairs.pkl', 'rb') as f:
+        titles_dict = pickle.load(f)
+
+# get docs length and corpus size
+if os.path.exists('id_doc_length_pairs.pkl'):
+    with open('id_doc_length_pairs.pkl', 'rb') as f:
+        doc_length_dict = pickle.load(f)
+
+N_DOCS = len(doc_length_dict)
+AVGDL = sum(doc_length_dict.values()) / N_DOCS
+
+
+def bm25_rank(query_terms, index, doc_length_dict, top_k=10, k1=1.5, b=0.75):
+    """
+    BM25 over index param using posting lists from GCP
+    """
+    if index is None:
+        return []
+
+    scores = {}
+
+    for t in query_terms:
+        # check if term exists in the index
+        if t not in index.df:
+            continue
+
+        df = index.df[t]
+
+        # read posting list for the specific term
+        try:
+            pl = index.read_a_posting_list("postings_gcp", t, "ir_bucket_storage")
+        except Exception:
+            continue
+
+        if not pl:
+            continue
+
+        # BM25 IDF calculation
+        idf = math.log(1.0 + (N_DOCS - df + 0.5) / (df + 0.5))
+
+        for doc_id, tf in pl:
+            dl = doc_length_dict.get(doc_id, AVGDL)
+
+            denom = tf + k1 * (1.0 - b + b * (dl / AVGDL))
+            score = idf * (tf * (k1 + 1.0)) / denom
+
+            scores[doc_id] = scores.get(doc_id, 0.0) + score
+
+    return heapq.nlargest(top_k, scores.items(), key=lambda x: x[1])
+
+
+def title_binary_candidates(query_terms, titles_dict, candidate_docs):
+    """
+    Calculates title hits using the doc_id -> title dictionary
+    """
+    hits = {}
+
+    # all unique query terms
+    q_terms = set(query_terms)
+
+    # get title for every relevant doc
+    for doc_id in candidate_docs:
+        title_text = titles_dict.get(doc_id, "")
+
+        if not title_text:
+            continue
+
+        # tokenize title
+        title_tokens = set(title_text.lower().split())
+        # title_tokens = [token.group() for token in RE_WORD.finditer(title_text.lower())]
+
+        # count hits
+        match_count = len(q_terms.intersection(title_tokens))
+
+        if match_count > 0:
+            hits[doc_id] = match_count
+
+    return hits
+
+
+def merge_body_and_title(body_ranked, title_hits, query_len, body_w=0.7, title_w=0.3, top_k=10):
+    """
+    Merge BM25 body scores with Title binary matches
+    """
+    scores = {}
+
+    # normalize body scores
+    for doc_id, s in body_ranked:
+        scores[doc_id] = scores.get(doc_id, 0.0) + (body_w * s)
+
+    # boost any doc found by title hits
+    if query_len > 0:
+        for doc_id, h in title_hits.items():
+            scores[doc_id] = scores.get(doc_id, 0.0) + (title_w * (h / query_len))
+
+    return heapq.nlargest(top_k, scores.items(), key=lambda x: x[1])
+
 
 @app.route("/search")
 def search():
@@ -104,56 +207,19 @@ def search():
         if token not in all_stopwords:
             query_tokens.append(token)
 
-    # get posting list for each token in the query
-    index = InvertedIndex.read_index("", "postings_gcp_index (3)")
-    index.bucket_name = 'ir_bucket_storage'
-    pls = []
-    for token in query_tokens:
-        try:
-            pls.append(dict(index.read_a_posting_list("postings_gcp", token, "ir_bucket_storage")))
-        except Exception as e:
-            # This handles tokens not found in the index
-            # print(f"Token '{token}' skipped: {e}")
-            continue
+    # calculate BM25 score
+    body_scores = bm25_rank(query_tokens, index, doc_length_dict)
+    # relevant doc ids for query
+    candidate_ids = [doc_id for doc_id, score in body_scores]
+    # check for title hits
+    title_hits = title_binary_candidates(query_tokens, titles_dict, candidate_ids)
+    # merge scores with uneven weights
+    final_scores = merge_body_and_title(body_scores, title_hits, len(query_tokens))
+    res = [(doc_id, titles_dict.get(doc_id, "")) for doc_id, score in final_scores]
 
-    # get docs length and corpus size
-    if os.path.exists('id_doc_length_pairs.pkl'):
-        with open('id_doc_length_pairs.pkl', 'rb') as f:
-            doc_length_dict = pickle.load(f)
-
-    # calculate cosine similarity score for the relevant docs
-    docs_scores_dict = get_cosine_similarity_score(index, query_tokens, pls, doc_length_dict)
-
-    # sort and add titles, take top 100 docs
-    top_n_items = heapq.nlargest(100, docs_scores_dict.items(), key=lambda x: x[1])
-
-    if os.path.exists('id_title_pairs.pkl'):
-        with open('id_title_pairs.pkl', 'rb') as f:
-            titles_dict = pickle.load(f)
-    res = [(doc_id, titles_dict[doc_id]) for doc_id, score in top_n_items]
     # END SOLUTION
     return jsonify(res)
 
-
-def get_cosine_similarity_score(index, query_tokens, pls, doc_length_dict, above_tfidf = 1):
-    docs_scores_dict = {}
-    query_index = 0
-    corpus_size = len(doc_length_dict)
-    for pl in pls:
-        for doc_id in pl:
-            tfidf = calc_tfidf(index, query_tokens[query_index], pl[doc_id]**above_tfidf, doc_id, corpus_size, doc_length_dict)
-            docs_scores_dict[doc_id] = docs_scores_dict.get(doc_id, 0) + tfidf
-        query_index += 1
-    q_len = len(query_tokens) ** 0.5
-    for doc_id in docs_scores_dict:
-        docs_scores_dict[doc_id] = docs_scores_dict[doc_id]/(q_len * (doc_length_dict[doc_id]**0.5))
-    return docs_scores_dict
-
-
-def calc_tfidf(index, token, tf, doc_id, corpus_size, doc_length_dict):
-    ntf = (tf)/doc_length_dict[doc_id]
-    idf = math.log(corpus_size/index.df[token], 10)
-    return ntf*idf
 
 @app.route("/search_body")
 def search_body():

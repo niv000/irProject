@@ -13,7 +13,7 @@ from google.cloud import storage
 from collections import defaultdict
 from contextlib import closing
 
-PROJECT_ID = 'YOUR-PROJECT-ID-HERE'
+PROJECT_ID = 'irproject-478010'
 def get_bucket(bucket_name):
     return storage.Client(PROJECT_ID).bucket(bucket_name)
 
@@ -55,8 +55,10 @@ class MultiFileWriter:
     def close(self):
         self._f.close()
 
+
 class MultiFileReader:
     """ Sequential binary reader of multiple files of up to BLOCK_SIZE each. """
+
     def __init__(self, base_dir, bucket_name=None):
         self._base_dir = Path(base_dir)
         self._bucket = None if bucket_name is None else get_bucket(bucket_name)
@@ -66,6 +68,7 @@ class MultiFileReader:
         b = []
         for f_name, offset in locs:
             f_name = str(self._base_dir / f_name)
+
             if f_name not in self._open_files:
                 self._open_files[f_name] = _open(f_name, 'rb', self._bucket)
             f = self._open_files[f_name]
@@ -74,14 +77,14 @@ class MultiFileReader:
             b.append(f.read(n_read))
             n_bytes -= n_read
         return b''.join(b)
-  
+
     def close(self):
         for f in self._open_files.values():
             f.close()
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.close()
-        return False 
+        return False
 
 TUPLE_SIZE = 6       # We're going to pack the doc_id and tf values in this 
                      # many bytes.
@@ -121,6 +124,7 @@ class InvertedIndex:
         """
         w2cnt = Counter(tokens)
         self.term_total.update(w2cnt)
+
         for w, cnt in w2cnt.items():
             self.df[w] = self.df.get(w, 0) + 1
             self._posting_list[w].append((doc_id, cnt))
