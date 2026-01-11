@@ -1,7 +1,5 @@
 from flask import Flask, request, jsonify
 import os
-# TODO: CHECK PATH
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"C:\Users\inbal\PycharmProjects\irProject\irproject-478010-e3f3d84eaa29.json"
 import math
 import heapq
 
@@ -363,4 +361,4 @@ def run(**options):
 
 if __name__ == '__main__':
     # run the Flask RESTful API, make the server publicly available (host='0.0.0.0') on port 8080
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    app.run(host='0.0.0.0', port=8080, debug=False)
